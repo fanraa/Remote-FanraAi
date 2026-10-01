@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Remote Touchpad</title>
+<style id="theme-style">
+/* Default theme (will be overridden by config) */
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;flex-direction:column;overflow:hidden;touch-action:none}
+header{padding:12px 16px;background:#16213e;border-bottom:1px solid #0f3460;display:flex;align-items:center;justify-content:space-between}
+h1{font-size:1.1rem;font-weight:600;color:#e94560}
+.status{font-size:.75rem;padding:4px 10px;border-radius:12px;background:#0f3460;color:#aaa}
+.status.connected{color:#4ade80}
+.status.connecting{color:#fbbf24}
+main{flex:1;position:relative;display:flex;flex-direction:column}
+#touchpad{flex:1;background:linear-gradient(145deg,#16213e 0%,#0f3460 100%);touch-action:none;position:relative;min-height:300px}
+#touchpad::before{content:'';position:absolute;inset:20px;border:1px dashed #0f3460;border-radius:12px;pointer-events:none}
+.touch-indicator{position:absolute;width:28px;height:28px;border-radius:50%;background:rgba(233,69,96,.5);border:2px solid #e94560;pointer-events:none;transform:translate(-50%,-50%);z-index:10}
+.touch-indicator.secondary{background:rgba(74,222,128,.5);border-color:#4ade80}
+.toolbar{padding:10px 16px;background:#16213e;border-top:1px solid #0f3460;display:flex;align-items:center;gap:12px}
+.slider-group{display:flex;align-items:center;gap:10px;flex:1;max-width:280px}
+.slider-group label{font-size:.7rem;color:#888;white-space:nowrap}
+input[type=range]{flex:1;accent-color:#e94560}
+.setting-value{font-size:.75rem;color:#e94560;font-weight:600;min-width:40px;text-align:right}
+.btn{padding:8px 14px;border:none;border-radius:8px;background:#0f3460;color:#eee;font-size:.9rem;min-height:40px;touch-action:manipulation}
+.btn.primary{background:#e94560}
+.btn.secondary{background:#4ade80;color:#1a1a2e}
+#keyboard-drawer{position:fixed;bottom:0;left:0;right:0;background:#16213e;border-top:1px solid #0f3460;padding:10px 16px 20px;transform:translateY(100%);transition:transform .3s ease;z-index:100;max-height:60vh;overflow-y:auto}
+#keyboard-drawer.open{transform:translateY(0)}
+.keyboard-row{display:flex;gap:3px;margin-bottom:5px;justify-content:center;flex-wrap:wrap}
+.key{min-width:34px;height:38px;border:none;border-radius:6px;background:#0f3460;color:#eee;font-size:.8rem;touch-action:manipulation}
+.key.wide{min-width:68px}
+.key.extra-wide{min-width:110px}
+.key.special{background:#1f2937;color:#fbbf24}
+.key.space{flex:1;min-width:150px}
+.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99;opacity:0;pointer-events:none;transition:opacity .3s}
+.drawer-overlay.visible{opacity:1;pointer-events:auto}
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%) translateY(100px);background:#1f2937;color:#eee;padding:10px 20px;border-radius:8px;font-size:.8rem;z-index:300;transition:transform .3s,opacity .3s;opacity:0}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+.toast.error{background:#ef4444}
+.toast.success{background:#4ade80;color:#1a1a2e}
+.gesture-hint{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:10px;padding:8px 14px;background:rgba(22,33,62,.95);border-radius:20px;border:1px solid #0f3460;font-size:.62rem;color:#888;white-space:nowrap;pointer-events:none;flex-wrap:wrap;justify-content:center;max-width:95%}
+.gesture-hint kbd{background:#0f3460;padding:2px 6px;border-radius:4px;color:#e94560}
+</style>
+</head>
+<body>
+<header>
+<h1>🖱️ Remote Touchpad</h1>
+<span id="status" class="status connecting">Menghubungkan...</span>
+</header>
+<main>
+<div id="touchpad">
+<div class="gesture-hint" id="gesture-hint"></div>
+</div>
+<div class="toolbar">
+<div class="slider-group">
+<label id="sens-label">Sens:</label>
+<input type="range" id="sensitivity" min="0.5" max="3" step="0.1" value="2">
+<span id="sens-value" class="setting-value">2.0x</span>
+</div>
+<button id="btn-keyboard" class="btn secondary">⌨️</button>
+</div>
+</main>
+<div class="drawer-overlay" id="keyboard-overlay"></div>
+<div id="keyboard-drawer"></div>
+<div class="toast" id="toast"></div>
+<script>
+// ============ Config (loaded from server) ============
+let CONFIG = null;
+let ws = null;
+let mouseSensitivity = 2.0;
+const fingers = new Map();
+let reconnectDelay = 1000;
+
+const touchpad = document.getElementById('touchpad');
+const statusEl = document.getElementById('status');
+const toast = document.getElementById('toast');
+const keyboardDrawer = document.getElementById('keyboard-drawer');
+const keyboardOverlay = document.getElementById('keyboard-overlay');
+const gestureHint = document.getElementById('gesture-hint');
+const sensSlider = document.getElementById('sensitivity');
+const sensValue = document.getElementById('sens-value');
+const sensLabel = document.getElementById('sens-label');
+
+// ============ Load config from server ============
+async function loadConfig() {
+  try {
+    const res = await fetch('/config');
+    CONFIG = await res.json();
+    applyConfig();
+  } catch (e) {
+    console.warn('Failed to load config, using defaults:', e);
+    CONFIG = getDefaultConfig();
+    applyConfig();
+  }
+}
+
+function getDefaultConfig() {
+  return {
+    touchpad: {
+      sensitivity: { default: 2.0, min: 0.5, max: 3.0, step: 0.1 },
+      gestures: {
+        one_finger: { tap_max_ms: 250, tap_max_px: 14, double_tap_max_ms: 350 },
+        two_finger: { scroll_factor: 0.6 }
+      },
+      reconnect: { initial_delay_ms: 1000, max_delay_ms: 10000, multiplier: 2 },
+      heartbeat: { interval_ms: 10000, timeout_ms: 30000 }
+    },
+    ui: {
+      theme: {
+        bg_primary: "#1a1a2e", bg_secondary: "#16213e", border: "#0f3460",
+        accent: "#e94560", accent_secondary: "#4ade80", text: "#eee", text_muted: "#888",
+        touch_primary: "rgba(233, 69, 96, 0.5)", touch_secondary: "rgba(74, 222, 128, 0.5)",
+        touch_border_primary: "#e94560", touch_border_secondary: "#4ade80"
+      },
+      layout: { touchpad_min_height: 300, gesture_hint_bottom: 16 },
+      show_gesture_hint: true, gesture_hint_fade_ms: 5000, gesture_hint_opacity_after_fade: 0.3
+    },
+    keyboard: { rows: [] },
+    server: { host: "0.0.0.0", port: 8000 }
+  };
+}
+
+function applyConfig() {
+  if (!CONFIG) return;
+  const c = CONFIG;
+  
+  // Theme
+  const t = c.ui.theme;
+  document.documentElement.style.setProperty('--bg-primary', t.bg_primary);
+  document.documentElement.style.setProperty('--bg-secondary', t.bg_secondary);
+  document.documentElement.style.setProperty('--border', t.border);
+  document.documentElement.style.setProperty('--accent', t.accent);
+  document.documentElement.style.setProperty('--accent-secondary', t.accent_secondary);
+  document.documentElement.style.setProperty('--text', t.text);
+  document.documentElement.style.setProperty('--text-muted', t.text_muted);
+  document.documentElement.style.setProperty('--touch-primary', t.touch_primary);
+  document.documentElement.style.setProperty('--touch-secondary', t.touch_secondary);
+  document.documentElement.style.setProperty('--touch-border-primary', t.touch_border_primary);
+  document.documentElement.style.setProperty('--touch-border-secondary', t.touch_border_secondary);
+  
+  // Update CSS variables dynamically
+  const style = document.getElementById('theme-style');
+  style.textContent = style.textContent
+    .replace(/#1a1a2e/g, t.bg_primary)
+    .replace(/#16213e/g, t.bg_secondary)
+    .replace(/#0f3460/g, t.border)
+    .replace(/#e94560/g, t.accent)
+    .replace(/#4ade80/g, t.accent_secondary)
+    .replace(/#eee/g, t.text)
+    .replace(/#888/g, t.text_muted)
+    .replace(/rgba\(233, 69, 96, 0\.5\)/g, t.touch_primary)
+    .replace(/rgba\(74, 222, 128, 0\.5\)/g, t.touch_secondary);
+  
+  // Sensitivity slider
+  const s = c.touchpad.sensitivity;
+  sensSlider.min = s.min;
+  sensSlider.max = s.max;
+  sensSlider.step = s.step;
+  sensSlider.value = s.default;
+  sensValue.textContent = s.default.toFixed(1) + 'x';
+  mouseSensitivity = s.default;
+  
+  // Keyboard layout
+  renderKeyboard(c.keyboard.rows || []);
+  
+  // Gesture hint
+  if (c.ui.show_gesture_hint !== false) {
+    renderGestureHint();
+    setTimeout(() => { gestureHint.style.opacity = c.ui.gesture_hint_opacity_after_fade || 0.3; }, c.ui.gesture_hint_fade_ms || 5000);
+  } else {
+    gestureHint.style.display = 'none';
+  }
+  
+  reconnectDelay = c.touchpad.reconnect?.initial_delay_ms || 1000;
+}
+
+function renderGestureHint() {
+  gestureHint.innerHTML = `
+    <span>1 jari <kbd>geser</kbd>=gerak</span>
+    <span>1 jari <kbd>tap</kbd>=klik kiri</span>
+    <span>2 jari <kbd>tap</kbd>=klik kanan</span>
+    <span>2 jari <kbd>geser</kbd>=scroll</span>
+    <span><kbd>2x tap</kbd>=double</span>
+  `;
+}
+
+function renderKeyboard(rows) {
+  if (!rows || rows.length === 0) return;
+  const drawer = document.getElementById('keyboard-drawer');
+  drawer.innerHTML = rows.map(row => {
+    const keys = row.map(k => {
+      if (typeof k === 'string') {
+        return `<button class="key" data-key="${escapeHtml(k)}">${escapeHtml(k)}</button>`;
+      }
+      const cls = ['key'];
+      if (k.wide) cls.push('wide');
+      if (k.extra_wide) cls.push('extra-wide');
+      if (k.special) cls.push('special');
+      if (k.space) cls.push('space');
+      return `<button class="${cls.join(' ')}" data-key="${escapeHtml(k.key)}">${escapeHtml(k.key === 'backspace' ? '⌫' : k.key === 'escape' ? 'Esc' : k.key === 'space' ? 'Space' : k.key)}</button>`;
+    }).join('');
+    return `<div class="keyboard-row">${keys}</div>`;
+  }).join('');
+  
+  // Re-bind key events
+  drawer.querySelectorAll('.key').forEach(k => {
+    k.addEventListener('click', () => send({ type: 'key', key: k.dataset.key }));
+  });
+}
+
+function escapeHtml(text) {
+  const map = { '&': '&', '<': '<', '>': '>', '"': '"', "'": '&#039;', '\\': '\\\\' };
+  return text.replace(/[&<>"'\\]/g, m => map[m]);
+}
+
+// ============ WebSocket ============
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  setStatus('Menghubungkan...', 'connecting');
+  ws.onopen = () => {
+    reconnectDelay = CONFIG?.touchpad?.reconnect?.initial_delay_ms || 1000;
+    setStatus('Terhubung', 'connected');
+    showToast('Terhubung ke laptop!', 'success');
+    send({ type: 'config', mouseSensitivity });
+  };
+  ws.onclose = () => {
+    setStatus('Terputus', 'connecting');
+    fingers.clear();
+    clearIndicators();
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * (CONFIG?.touchpad?.reconnect?.multiplier || 2), CONFIG?.touchpad?.reconnect?.max_delay_ms || 10000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+  ws.onmessage = (ev) => {
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'ping' && ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong' }));
+    } catch(e){}
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function setStatus(t, c) { statusEl.textContent = t; statusEl.className = 'status ' + c; }
+function showToast(msg, cls) {
+  toast.textContent = msg;
+  toast.className = 'toast show ' + (cls || '');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+// ============ Indikator ============
+function clearIndicators() { document.querySelectorAll('.touch-indicator').forEach(el => el.remove()); }
+function makeIndicator(x, y, secondary) {
+  const r = touchpad.getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'touch-indicator' + (secondary ? ' secondary' : '');
+  el.style.left = (x - r.left) + 'px';
+  el.style.top = (y - r.top) + 'px';
+  touchpad.appendChild(el);
+  return el;
+}
+function moveIndicator(el, x, y) {
+  if (!el) return;
+  const r = touchpad.getBoundingClientRect();
+  el.style.left = (x - r.left) + 'px';
+  el.style.top = (y - r.top) + 'px';
+}
+
+// ============ Gesture ============
+const TAP_MAX_MS = CONFIG?.touchpad?.gestures?.one_finger?.tap_max_ms || 250;
+const TAP_MAX_PX = CONFIG?.touchpad?.gestures?.one_finger?.tap_max_px || 14;
+const DOUBLE_MS = CONFIG?.touchpad?.gestures?.one_finger?.double_tap_max_ms || 350;
+const SCROLL_FACTOR = CONFIG?.touchpad?.gestures?.two_finger?.scroll_factor || 0.6;
+
+let lastTapTime = 0, lastTapFingers = 0;
+
+touchpad.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const now = performance.now();
+  for (const t of e.changedTouches) {
+    fingers.set(t.identifier, { sx: t.clientX, sy: t.clientY, lx: t.clientX, ly: t.clientY, st: now, moved: false, el: makeIndicator(t.clientX, t.clientY, fingers.size > 0) });
+  }
+}, { passive: false });
+
+touchpad.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const r = touchpad.getBoundingClientRect();
+  const n = fingers.size;
+  for (const t of e.changedTouches) {
+    const f = fingers.get(t.identifier);
+    if (!f) continue;
+    const dxPx = t.clientX - f.lx, dyPx = t.clientY - f.ly;
+    f.lx = t.clientX; f.ly = t.clientY;
+    if (Math.hypot(t.clientX - f.sx, t.clientY - f.sy) > TAP_MAX_PX) f.moved = true;
+    moveIndicator(f.el, t.clientX, t.clientY);
+    if (n === 1) {
+      send({ type: 'move', dx: dxPx / r.width * 900 * mouseSensitivity, dy: dyPx / r.height * 900 * mouseSensitivity });
+    } else if (n === 2) {
+      send({ type: 'scroll', dy: -dyPx * SCROLL_FACTOR });
+    }
+  }
+}, { passive: false });
+
+function endTouch(e) {
+  e.preventDefault();
+  const now = performance.now();
+  const n = fingers.size;
+  let tapFingers = 0;
+  for (const t of e.changedTouches) {
+    const f = fingers.get(t.identifier);
+    if (!f) continue;
+    const quick = (now - f.st) < TAP_MAX_MS;
+    const still = Math.hypot(t.clientX - f.sx, t.clientY - f.sy) <= TAP_MAX_PX;
+    if (quick && still && !f.moved) tapFingers++;
+    if (f.el) f.el.remove();
+    fingers.delete(t.identifier);
+  }
+  if (tapFingers > 0 && fingers.size === 0) {
+    if (tapFingers === 1) {
+      if (n === 1 && now - lastTapTime < DOUBLE_MS && lastTapFingers === 1) {
+        send({ type: 'click', button: 'double' });
+        lastTapTime = 0;
+      } else {
+        send({ type: 'click', button: 'left' });
+        lastTapTime = now; lastTapFingers = 1;
+      }
+    } else if (tapFingers === 2) {
+      send({ type: 'click', button: 'right' });
+      lastTapTime = now; lastTapFingers = 2;
+    }
+  }
+}
+touchpad.addEventListener('touchend', endTouch, { passive: false });
+touchpad.addEventListener('touchcancel', (e) => {
+  for (const t of e.changedTouches) {
+    const f = fingers.get(t.identifier);
+    if (f && f.el) f.el.remove();
+    fingers.delete(t.identifier);
+  }
+});
+
+// mouse desktop (testing)
+let mDown = false, mLx = 0, mLy = 0, mEl = null;
+touchpad.addEventListener('mousedown', (e) => {
+  mDown = true; mLx = e.clientX; mLy = e.clientY;
+  mEl = makeIndicator(e.clientX, e.clientY, false);
+});
+touchpad.addEventListener('mousemove', (e) => {
+  if (!mDown) return;
+  const r = touchpad.getBoundingClientRect();
+  send({ type: 'move', dx: (e.clientX - mLx) / r.width * 900 * mouseSensitivity, dy: (e.clientY - mLy) / r.height * 900 * mouseSensitivity });
+  mLx = e.clientX; mLy = e.clientY;
+  moveIndicator(mEl, e.clientX, e.clientY);
+});
+touchpad.addEventListener('mouseup', () => { mDown = false; if (mEl) mEl.remove(); mEl = null; });
+touchpad.addEventListener('wheel', (e) => { e.preventDefault(); send({ type: 'scroll', dy: -e.deltaY * 0.05 }); }, { passive: false });
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// ============ Sensitivitas & keyboard ============
+sensSlider.addEventListener('input', () => {
+  mouseSensitivity = parseFloat(sensSlider.value);
+  sensValue.textContent = mouseSensitivity.toFixed(1) + 'x';
+  send({ type: 'config', mouseSensitivity });
+});
+const btnKb = document.getElementById('btn-keyboard');
+function toggleKb() {
+  const open = keyboardDrawer.classList.toggle('open');
+  keyboardOverlay.classList.toggle('visible', open);
+  btnKb.classList.toggle('primary', open);
+}
+btnKb.addEventListener('click', toggleKb);
+keyboardOverlay.addEventListener('click', toggleKb);
+document.addEventListener('visibilitychange', () => { if (document.hidden) { fingers.clear(); clearIndicators(); } });
+
+// ============ Init ============
+loadConfig().then(connect);
+</script>
+</body>
+</html>

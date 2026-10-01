@@ -1,0 +1,73 @@
+{
+  "touchpad": {
+    "sensitivity": {
+      "default": 2.0,
+      "min": 0.5,
+      "max": 3.0,
+      "step": 0.1
+    },
+    "gestures": {
+      "one_finger": {
+        "drag": "move_mouse",
+        "tap": "left_click",
+        "double_tap": "double_click",
+        "tap_max_ms": 250,
+        "tap_max_px": 14,
+        "double_tap_max_ms": 350
+      },
+      "two_finger": {
+        "drag": "scroll",
+        "tap": "right_click",
+        "scroll_factor": 0.6
+      }
+    },
+    "reconnect": {
+      "initial_delay_ms": 1000,
+      "max_delay_ms": 10000,
+      "multiplier": 2
+    },
+    "heartbeat": {
+      "interval_ms": 10000,
+      "timeout_ms": 30000
+    }
+  },
+  "ui": {
+    "theme": {
+      "bg_primary": "#1a1a2e",
+      "bg_secondary": "#16213e",
+      "border": "#0f3460",
+      "accent": "#e94560",
+      "accent_secondary": "#4ade80",
+      "text": "#eee",
+      "text_muted": "#888",
+      "touch_primary": "rgba(233, 69, 96, 0.5)",
+      "touch_secondary": "rgba(74, 222, 128, 0.5)",
+      "touch_border_primary": "#e94560",
+      "touch_border_secondary": "#4ade80"
+    },
+    "layout": {
+      "touchpad_min_height": 300,
+      "gesture_hint_bottom": 16,
+      "toolbar_height": "auto",
+      "keyboard_max_height": "60vh"
+    },
+    "show_gesture_hint": true,
+    "gesture_hint_fade_ms": 5000,
+    "gesture_hint_opacity_after_fade": 0.3
+  },
+  "keyboard": {
+    "rows": [
+      ["`", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", { "key": "backspace", "wide": true, "special": true }],
+      [{ "key": "tab", "wide": true, "special": true }, "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "[", "]", { "key": "\\\\", "wide": true }],
+      [{ "key": "caps", "extra_wide": true, "special": true }, "a", "s", "d", "f", "g", "h", "j", "k", "l", ";", "'", { "key": "enter", "wide": true, "special": true }],
+      [{ "key": "shift", "extra_wide": true, "special": true }, "z", "x", "c", "v", "b", "n", "m", ",", ".", "/", { "key": "shift", "wide": true, "special": true }],
+      [{ "key": "ctrl", "special": true }, { "key": "cmd", "special": true }, { "key": "alt", "special": true }, { "key": "space", "space": true }, { "key": "alt", "special": true }, { "key": "escape", "wide": true, "special": true }, { "key": "backspace", "wide": true, "special": true }],
+      [{ "key": "up", "wide": true, "special": true }, { "key": "left", "wide": true, "special": true }, { "key": "down", "wide": true, "special": true }, { "key": "right", "wide": true, "special": true }]
+    ]
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "log_level": "info"
+  }
+}

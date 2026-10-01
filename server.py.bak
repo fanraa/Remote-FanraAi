@@ -1,0 +1,398 @@
+"""
+Remote Touchpad Server
+Jalankan di laptop: python server.py
+Akses dari HP: http://<IP_LAPTOP>:8000
+Atau lewat tunnel: https://<tunnel_url>
+"""
+import asyncio
+import json
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from pynput.mouse import Controller as MouseController, Button
+from pynput.keyboard import Controller as KeyboardController, Key
+
+# ==================== Load Config ====================
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# Sensitivity & config from config.json
+MOUSE_SENSITIVITY = CONFIG["touchpad"]["sensitivity"]["default"]
+SCROLL_SENSITIVITY = CONFIG["touchpad"]["gestures"]["two_finger"]["scroll_factor"]
+PINCH_ZOOM_THRESHOLD = 0.05
+CLICK_THRESHOLD_MS = CONFIG["touchpad"]["gestures"]["one_finger"]["tap_max_ms"]
+CLICK_THRESHOLD_PX = CONFIG["touchpad"]["gestures"]["one_finger"]["tap_max_px"] / 100  # normalize
+DOUBLE_TAP_WINDOW_MS = CONFIG["touchpad"]["gestures"]["one_finger"]["double_tap_max_ms"]
+
+HEARTBEAT_INTERVAL = CONFIG["touchpad"]["heartbeat"]["interval_ms"] / 1000
+HEARTBEAT_TIMEOUT = CONFIG["touchpad"]["heartbeat"]["timeout_ms"] / 1000
+
+# Track touch state per connection
+connection_states = {}
+
+
+def move_mouse(dx: float, dy: float):
+    """Move mouse relatively"""
+    x, y = mouse.position
+    mouse.position = (x + dx * MOUSE_SENSITIVITY, y + dy * MOUSE_SENSITIVITY)
+
+
+def click_mouse(button: str, down: bool):
+    """Click mouse button"""
+    btn = Button.left if button == "left" else Button.right
+    if down:
+        mouse.press(btn)
+    else:
+        mouse.release(btn)
+
+
+def scroll_mouse(dy: float):
+    """Scroll mouse wheel"""
+    mouse.scroll(0, dy * SCROLL_SENSITIVITY)
+
+
+def type_key(key_str: str):
+    """Type a key (for virtual keyboard)"""
+    special_keys = {
+        "enter": Key.enter,
+        "space": Key.space,
+        "backspace": Key.backspace,
+        "tab": Key.tab,
+        "escape": Key.esc,
+        "shift": Key.shift,
+        "ctrl": Key.ctrl,
+        "alt": Key.alt,
+        "cmd": Key.cmd,
+        "up": Key.up,
+        "down": Key.down,
+        "left": Key.left,
+        "right": Key.right,
+    }
+    if key_str in special_keys:
+        keyboard.press(special_keys[key_str])
+        keyboard.release(special_keys[key_str])
+    else:
+        keyboard.type(key_str)
+
+
+# ==================== FastAPI App ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"\n🚀 Remote Touchpad Server running!")
+    print(f"📱 Local access: http://<IP_LAPTOP>:8000")
+    print(f"🌐 Tunnel: npx ngrok http 8000  (or cloudflared tunnel --url http://localhost:8000)")
+    print(f"🛑 Stop: Ctrl+C\n")
+    yield
+    print("\n👋 Server stopped")
+
+
+app = FastAPI(title="Remote Touchpad", lifespan=lifespan)
+
+# Load HTML template at startup
+with open("templates/index.html", "r", encoding="utf-8") as f:
+    INDEX_HTML = f.read()
+
+
+# ==================== WebSocket Handler ====================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[WebSocket, dict] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[websocket] = {
+            "connected_at": time.time(),
+            "last_pong": time.time(),
+            "touch_state": {}
+        }
+        print(f"📱 Device connected. Total: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            del self.active_connections[websocket]
+        print(f"📱 Device disconnected. Total: {len(self.active_connections)}")
+
+    async def send_ping(self, websocket: WebSocket):
+        try:
+            await websocket.send_text(json.dumps({"type": "ping", "t": time.time()}))
+        except Exception:
+            pass
+
+    def update_pong(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections[websocket]["last_pong"] = time.time()
+
+
+manager = ConnectionManager()
+
+
+# Heartbeat task
+async def heartbeat_loop():
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        now = time.time()
+        dead = []
+        for ws, state in manager.active_connections.items():
+            if now - state["last_pong"] > HEARTBEAT_TIMEOUT:
+                dead.append(ws)
+            else:
+                await manager.send_ping(ws)
+        for ws in dead:
+            print(f"💀 Connection timeout, closing")
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            manager.disconnect(ws)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    conn_state = manager.active_connections[websocket]
+    touch_state = conn_state["touch_state"]
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            
+            # Handle pong
+            if msg.get("type") == "pong":
+                manager.update_pong(websocket)
+                continue
+                
+            await handle_message(msg, touch_state, websocket)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"❌ WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+
+async def handle_message(msg: dict, touch_state: dict, websocket: WebSocket):
+    """Process incoming touchpad/keyboard events"""
+    msg_type = msg.get("type")
+
+    if msg_type == "move":
+        # Relative mouse movement from primary finger (already scaled by client)
+        dx = msg.get("dx", 0)
+        dy = msg.get("dy", 0)
+        move_mouse(dx, dy)
+
+    elif msg_type == "scroll":
+        # Scroll from two-finger drag (dy is already in pixel-like units from client)
+        dy = msg.get("dy", 0)
+        scroll_mouse(dy)
+
+    elif msg_type == "click":
+        # Direct click from client (simpler & more reliable)
+        button = msg.get("button", "left")
+        if button == "left":
+            click_mouse("left", True)
+            click_mouse("left", False)
+        elif button == "right":
+            click_mouse("right", True)
+            click_mouse("right", False)
+        elif button == "double":
+            click_mouse("left", True)
+            click_mouse("left", False)
+            click_mouse("left", True)
+            click_mouse("left", False)
+
+    elif msg_type == "touch_start":
+        # Finger down (legacy, kept for compatibility)
+        touch_id = msg.get("touchId", 0)
+        x = msg.get("x", 0)
+        y = msg.get("y", 0)
+        timestamp = msg.get("t", time.time() * 1000)
+
+        touch_state[touch_id] = {
+            "start_x": x,
+            "start_y": y,
+            "last_x": x,
+            "last_y": y,
+            "start_time": timestamp,
+            "moved": False,
+            "tap_count": 0,
+            "last_tap_time": 0,
+            "ended": False,
+        }
+
+        # Check for double tap on same finger
+        t = touch_state[touch_id]
+        if timestamp - t["last_tap_time"] < DOUBLE_TAP_WINDOW_MS:
+            t["tap_count"] += 1
+        else:
+            t["tap_count"] = 1
+        t["last_tap_time"] = timestamp
+
+    elif msg_type == "touch_move":
+        # Finger dragging (legacy)
+        touch_id = msg.get("touchId", 0)
+        x = msg.get("x", 0)
+        y = msg.get("y", 0)
+
+        if touch_id not in touch_state:
+            return
+
+        t = touch_state[touch_id]
+        dx = x - t["last_x"]
+        dy = y - t["last_y"]
+        t["last_x"] = x
+        t["last_y"] = y
+
+        # Check if moved enough to cancel tap
+        total_dx = x - t["start_x"]
+        total_dy = y - t["start_y"]
+        if (total_dx ** 2 + total_dy ** 2) ** 0.5 > CLICK_THRESHOLD_PX:
+            t["moved"] = True
+
+        # Count active touches (not ended)
+        active_touches = [(tid, td) for tid, td in touch_state.items() if not td.get("ended", False)]
+        active_ids = [tid for tid, _ in active_touches]
+
+        if len(active_touches) == 1 and active_ids[0] == touch_id and not t["moved"]:
+            # Single finger drag = move mouse (dx, dy are already normalized 0-1, scale by 100 for pixels)
+            move_mouse(dx * 100, dy * 100)
+        elif len(active_touches) == 2:
+            # Two finger drag = scroll
+            other = next((td for tid, td in active_touches if tid != touch_id), None)
+            if other:
+                other_dy = y - other["last_y"]
+                avg_dy = (dy + other_dy) / 2
+                scroll_mouse(-avg_dy * 100)
+
+    elif msg_type == "touch_end":
+        # Finger lifted (legacy)
+        touch_id = msg.get("touchId", 0)
+        timestamp = msg.get("t", time.time() * 1000)
+
+        if touch_id not in touch_state:
+            return
+
+        t = touch_state[touch_id]
+        t["ended"] = True
+        t["end_time"] = timestamp
+
+        # Count OTHER active touches (not ended, excluding this one)
+        other_active_count = sum(1 for tid, td in touch_state.items() 
+                                 if tid != touch_id and not td.get("ended", False))
+
+        # Determine action based on tap count and other active touches
+        if not t["moved"] and (timestamp - t["start_time"]) < CLICK_THRESHOLD_MS:
+            if t["tap_count"] >= 2:
+                click_mouse("left", True)
+                click_mouse("left", False)
+                click_mouse("left", True)
+                click_mouse("left", False)
+            elif other_active_count == 0:
+                click_mouse("left", True)
+                click_mouse("left", False)
+            elif other_active_count == 1:
+                click_mouse("right", True)
+                click_mouse("right", False)
+
+        # Clean up ended touches older than 500ms
+        now = time.time() * 1000
+        to_delete = []
+        for tid, td in touch_state.items():
+            if td.get("ended", False) and (now - td.get("end_time", now)) > 500:
+                to_delete.append(tid)
+        for tid in to_delete:
+            del touch_state[tid]
+
+    elif msg_type == "pinch":
+        # Pinch zoom (two-finger) - legacy support
+        touch_id = msg.get("touchId", "0")
+        x = msg.get("x", 0)
+        y = msg.get("y", 0)
+        handle_pinch_zoom(touch_id, x, y)
+
+    elif msg_type == "key":
+        key = msg.get("key", "")
+        if key:
+            type_key(key)
+
+    elif msg_type == "text":
+        text = msg.get("text", "")
+        keyboard.type(text)
+
+    elif msg_type == "config":
+        global MOUSE_SENSITIVITY, SCROLL_SENSITIVITY, PINCH_ZOOM_THRESHOLD
+        MOUSE_SENSITIVITY = msg.get("mouseSensitivity", MOUSE_SENSITIVITY)
+        SCROLL_SENSITIVITY = msg.get("scrollSensitivity", SCROLL_SENSITIVITY)
+        PINCH_ZOOM_THRESHOLD = msg.get("pinchThreshold", PINCH_ZOOM_THRESHOLD)
+
+
+def handle_pinch_zoom(touch_id: str, x: float, y: float):
+    """Handle pinch zoom with two touch points"""
+    if not hasattr(handle_pinch_zoom, "points"):
+        handle_pinch_zoom.points = {}
+    handle_pinch_zoom.points[touch_id] = (x, y)
+
+    if len(handle_pinch_zoom.points) >= 2:
+        points = list(handle_pinch_zoom.points.values())
+        dx = points[0][0] - points[1][0]
+        dy = points[0][1] - points[1][1]
+        distance = (dx ** 2 + dy ** 2) ** 0.5
+
+        if not hasattr(handle_pinch_zoom, "last_distance"):
+            handle_pinch_zoom.last_distance = distance
+            return
+
+        diff = distance - handle_pinch_zoom.last_distance
+        if abs(diff) > PINCH_ZOOM_THRESHOLD:
+            with keyboard.pressed(Key.ctrl):
+                mouse.scroll(0, diff * 2)
+            handle_pinch_zoom.last_distance = distance
+    else:
+        handle_pinch_zoom.last_distance = None
+
+
+# ==================== HTTP Routes ====================
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return HTMLResponse(content=INDEX_HTML)
+
+
+@app.get("/config", response_class=JSONResponse)
+async def get_config():
+    return CONFIG
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "connections": len(manager.active_connections)}
+
+
+# ==================== Main ====================
+if __name__ == "__main__":
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = "127.0.0.1"
+    finally:
+        s.close()
+
+    print(f"\n🌐 Local IP: {local_ip}")
+    print(f"📱 Access from phone: http://{local_ip}:8000")
+    print()
+
+    # Start heartbeat task
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(heartbeat_loop())
+    
+    server_config = CONFIG.get("server", {})
+    uvicorn.run(app, host=server_config.get("host", "0.0.0.0"), port=server_config.get("port", 8000), log_level=server_config.get("log_level", "info"))
